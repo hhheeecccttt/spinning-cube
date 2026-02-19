@@ -9,6 +9,9 @@
 #include <vector>
 #include <sys/ioctl.h>
 #include <unistd.h>
+#include <csignal>
+#include <cstring>
+#include <string>
 
 using namespace std;
 using namespace std::chrono_literals;
@@ -20,8 +23,12 @@ int screenCenterX = numCols / 2;
 int screenCenterY = numRows / 2;
 
 float xScale = 2;
-int scale = 25;
+int defaultScale = 25;
+int scale = 25; 
 int cameraDistance = 5;
+
+int rowScale;
+int colScale;
 
 float angleX = 0;
 float angleY = 0;
@@ -30,6 +37,10 @@ float angleZ = 0;
 float cameraZ = 10.0f;
 auto interval = 100ms;
 vector<char> screenBuffer;
+
+volatile sig_atomic_t FLAG_SIGWINCH = 1;
+
+char faceChars[6] = {'.','-','=','+','#','@'};
 
 array<float, 24> vertices = {
     -1.0f, -1.0f,  1.0f,
@@ -65,8 +76,12 @@ const int triangles[12][3] = {
     {4,5,0}, {5,1,0}
 };
 
-array<float,16> projectVertices() {
-    array<float, 16> projectedVertices = {};
+void handleSIGWINCH(int) {
+    FLAG_SIGWINCH = 1;
+}
+
+array<int,16> projectVertices() {
+    array<int, 16> projectedVertices = {};
     for (int n = 0; n < 8; n++) {
         float z = transformedVertices[3 * n + 2];
         float cameraScale = cameraDistance / (cameraZ - z);
@@ -110,11 +125,11 @@ void rotatePoints() {
 }
 
 void fillTriangle(int x1, int y1, int x2, int y2, int x3, int y3, char pixel) {
-    int minX = min({x1, x2, x3});
-    int maxX = max({x1, x2, x3});
-    int minY = min({y1, y2, y3});
-    int maxY = max({y1, y2, y3});
-
+    int minX = max(0, min({x1, x2, x3}));
+    int maxX = min(numCols - 1, max({x1, x2, x3}));
+    int minY = max(0, min({y1, y2, y3}));
+    int maxY = min(numRows - 1, max({y1, y2, y3}));
+    
     auto edge = [](int x0,int y0,int x1,int y1,int x,int y){
         return (x - x0)*(y1 - y0) - (y - y0)*(x1 - x0);
     };
@@ -126,7 +141,7 @@ void fillTriangle(int x1, int y1, int x2, int y2, int x3, int y3, char pixel) {
             int w1 = edge(x3,y3,x1,y1,x,y);
             int w2 = edge(x1,y1,x2,y2,x,y);
 
-            if ((w0 >= 0 && w1 >= 0 && w2 >= 0) && (x >= 0 && x < numCols && y >= 0 && y < numRows)) {
+            if (w0 >= 0 && w1 >= 0 && w2 >= 0) {
                 screenBuffer[y * numCols + x] = pixel;
             }
         }
@@ -143,26 +158,36 @@ bool isFrontFace(int x1, int y1, int x2, int y2, int x3, int y3)
 int main() {    
     cout << "\033[?25l";
     std::ios::sync_with_stdio(false);
+    signal(SIGWINCH, handleSIGWINCH);
 
     while (true) {
-        struct winsize w;
-        ioctl(STDOUT_FILENO, TIOCGWINSZ, &w);
-        numRows = w.ws_row;
-        numCols = w.ws_col;
-        screenCenterX = numCols / 2;
-        screenCenterY = numRows / 2;
+        if (FLAG_SIGWINCH) {
+            struct winsize w;
+            ioctl(STDOUT_FILENO, TIOCGWINSZ, &w);
+            numRows = w.ws_row;
+            numCols = w.ws_col;
+            screenCenterX = numCols / 2;
+            screenCenterY = numRows / 2;
+            FLAG_SIGWINCH = 0;
+
+            rowScale = defaultScale * numRows / 47;
+            if (numCols > 95) {
+                colScale = defaultScale;
+            } else {
+                colScale = defaultScale * numCols / 95;
+            }
+            scale = min(rowScale, colScale);
+        }
 
         size_t requiredSize = numRows * numCols;
         if (screenBuffer.size() != requiredSize) {
-            screenBuffer.assign(requiredSize, ' ');
+            screenBuffer.resize(requiredSize, ' ');
         } else {
-            std::fill(screenBuffer.begin(), screenBuffer.end(), ' ');
+            std::memset(screenBuffer.data(), ' ', requiredSize);
         }
 
         rotatePoints();
         auto projectedVertices = projectVertices();
-
-        char faceChars[6] = {'.','-','=','+','#','@'};
 
         for (int n = 0; n < 12; n++) {
             int v1 = triangles[n][0];
@@ -179,19 +204,18 @@ int main() {
             int y3 = projectedVertices[2 * v3 + 1];
 
             if (isFrontFace(x1,y1,x2,y2,x3,y3)) {
-                char pixel = faceChars[n / 2];
+                char pixel = faceChars[n >> 1];
                 fillTriangle(x1,y1,x2,y2,x3,y3,pixel);
             }
         }
 
-        cout << "\033[H";
+        write(STDOUT_FILENO, "\033[H", 3);
+        write(STDOUT_FILENO, screenBuffer.data(), requiredSize);
 
-        cout.write(screenBuffer.data(), screenBuffer.size());
-        cout << '\n';   
 
-        cout.flush();
+        static float t = 0;
+        t += interval.count() * 0.001f;
 
-        float t = chrono::duration<float>(chrono::steady_clock::now().time_since_epoch()).count();
         angleX = 100 * 0.03f * sin(t * 0.5f + 1);
         angleY = 100 * 0.04f * cos(t * 0.4f + 2);
         angleZ = 100 * 0.05f * sin(t * 0.3f + 3);
